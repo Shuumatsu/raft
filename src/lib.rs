@@ -1,6 +1,22 @@
-use std::cmp::Ordering;
-use std::sync::mpsc;
+#![feature(let_chains)]
+#[macro_use]
+extern crate async_recursion;
+#[macro_use]
+extern crate serde;
+
+use futures::{future::Ready, prelude::*};
+use std::cmp::{self, Ordering};
 use std::time;
+use tarpc::context;
+use tokio::sync::mpsc;
+
+mod rpc;
+
+use rpc::{AppendEntriesArgs, AppendEntriesReply, Raft, RequestVoteArgs, RequestVoteReply};
+
+type Term = usize;
+
+type ServerId = usize;
 
 #[derive(Debug)]
 pub enum Event {
@@ -8,16 +24,16 @@ pub enum Event {
     // 当一个候选人从整个集群的大多数服务器节点获得了针对同一个任期号的选票，那么他就赢得了这次选举并成为领导人。
     // 候选人发起投票后，如果在一定时间内没有获得半数以上的投票的话，则视为失败
     VoteTimeout, // VoteFailure
-    RequestVoteReq { candidate: usize },
+    RequestVoteReq { candidate: ServerId },
     RequestVoteResp { ok: bool },
     // AppendEntries RPC 由领导者调用，用于日志条目的复制，同时也被当做心跳使用
-    AppendEntriesReq { leader: usize },
+    AppendEntriesReq { leader: ServerId },
     AppendEntriesResp { ok: bool },
 }
 
 #[derive(Debug)]
 pub struct Input {
-    term: usize,
+    term: Term,
     event: Event,
 }
 
@@ -31,24 +47,26 @@ pub enum Role {
         votes_cnt: usize,
     },
     Follower {
-        voted_for: Option<usize>,
+        voted_for: Option<ServerId>,
         timestamp: time::Instant,
     },
 }
 
+pub type LogEntry = (usize, String);
+
 #[derive(Debug)]
 pub struct PersistentState {
-    term: usize,
-    id: usize,
-    log: Vec<usize>,
+    term: Term,
+    id: ServerId,
+    log_entries: Vec<LogEntry>,
 }
 
 impl PersistentState {
-    pub fn new(id: usize) -> Self {
+    pub fn new(id: ServerId) -> Self {
         PersistentState {
             term: 0,
             id,
-            log: vec![],
+            log_entries: vec![],
         }
     }
 }
@@ -56,8 +74,8 @@ impl PersistentState {
 #[derive(Debug)]
 pub struct Server {
     persistent_state: PersistentState,
-    commit_index: usize,
-    last_applied: usize,
+    commit_index: Option<usize>, // 已知已提交的最高的日志条目的索引（初始值为 0，单调递增）
+    last_applied: Option<usize>, // 已经被应用到状态机的最高的日志条目的索引（初始值为 0，单调递增）
     system_servers: Vec<usize>,
     role: Role,
 }
@@ -66,8 +84,8 @@ impl Server {
     pub fn new(id: usize, system_servers: Vec<usize>) -> Self {
         Server {
             persistent_state: PersistentState::new(id),
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: None,
+            last_applied: None,
             role: Role::Follower {
                 voted_for: None,
                 timestamp: time::Instant::now(),
@@ -76,11 +94,38 @@ impl Server {
         }
     }
 
-    pub fn run(&mut self) {
+    pub async fn send_request_vote(&mut self, peer: usize) {
         unimplemented!()
     }
 
-    pub fn react(&mut self, input: Input) {
+    pub async fn start_election(&mut self) {
+        match self.role {
+            Role::Follower { .. } => {
+                unimplemented!()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub async fn anounce_leadership(&mut self) {
+        match self.role {
+            Role::Leader { .. } => {
+                unimplemented!()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub async fn run(&mut self) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
+
+        while let Some(input) = rx.recv().await {
+            self.react(input);
+        }
+    }
+
+    #[async_recursion(?Send)]
+    pub async fn react(&mut self, input: Input) {
         match (input.term.cmp(&self.persistent_state.term), &mut self.role) {
             // 忽略所有已过期的事件
             (Ordering::Less, _) => {}
@@ -95,7 +140,7 @@ impl Server {
                         voted_for: None,
                         timestamp: time::Instant::now(),
                     };
-                    self.react(input)
+                    self.react(input).await
                 }
                 // 计时器事件不可能有更高的 term
                 _ => unreachable!(),
@@ -139,6 +184,7 @@ impl Server {
                         voted_for: None,
                         timestamp: time::Instant::now(),
                     };
+                    self.react(input).await
                 }
                 // 在同一 term，不存在从 Leader 到 Candidate 的转变，不应曾发起过 AppendEntries 请求
                 Event::AppendEntriesResp { .. } => unreachable!(),
@@ -182,6 +228,72 @@ impl Server {
                 // 在同一 term，可能先处于 Candidate 状态后处于 Follower 状态，忽略已过期的计时器
                 Event::VoteTimeout { .. } => {}
             },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Service(usize);
+
+#[tarpc::server]
+impl Raft for Server {
+    async fn request_vote(
+        mut self,
+        ctx: context::Context,
+        args: RequestVoteArgs,
+    ) -> RequestVoteReply {
+        let progress = {
+            let log_entries = &self.persistent_state.log_entries;
+            let entry = log_entries.last();
+            entry.map(|(term, _)| (*term, log_entries.len() - 1))
+        };
+
+        match &mut self.role {
+            Role::Follower {
+                ref mut voted_for, ..
+            } if voted_for.is_none() && args.prev_entry_identifier >= progress => {
+                *voted_for = Some(args.candidate_id);
+                RequestVoteReply {
+                    responser_term: self.persistent_state.term,
+                    vote_granted: true,
+                }
+            }
+            _ => RequestVoteReply {
+                responser_term: self.persistent_state.term,
+                vote_granted: false,
+            },
+        }
+    }
+
+    async fn append_entries(
+        mut self,
+        _: context::Context,
+        args: AppendEntriesArgs,
+    ) -> AppendEntriesReply {
+        if let Some((prev_index, prev_term)) = args.prev_entry_identifier {
+            if self.persistent_state.log_entries[prev_index].0 != prev_term {
+                return AppendEntriesReply {
+                    success: false,
+                    responser_term: self.persistent_state.term,
+                };
+            }
+        }
+
+        let curr_index = args.prev_entry_identifier.map(|(i, _)| i + 1).unwrap_or(0);
+        self.persistent_state.log_entries.truncate(curr_index);
+        for entry in args.entries {
+            self.persistent_state.log_entries.push(entry);
+        }
+        if args.leader_commit > self.commit_index {
+            self.commit_index = cmp::min(
+                self.persistent_state.log_entries.len().checked_sub(1),
+                args.leader_commit,
+            );
+        }
+
+        AppendEntriesReply {
+            success: true,
+            responser_term: self.persistent_state.term,
         }
     }
 }
