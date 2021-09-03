@@ -562,6 +562,7 @@ dependencies = [
  "clap",
  "futures",
  "lazy_static",
+ "scopeguard",
  "serde",
  "serde_json",
  "tarpc",
