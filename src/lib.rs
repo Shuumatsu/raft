@@ -7,14 +7,10 @@ extern crate serde;
 
 use futures::prelude::*;
 use scopeguard::guard_on_success;
-use std::cell::RefCell;
 use std::cmp::{self, Ordering};
-use std::rc::Rc;
-use std::sync::atomic::{self, AtomicUsize};
-use std::sync::Arc;
 use tarpc::context;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time;
+use tokio::time::{sleep, Duration, Instant};
 
 mod rpc;
 
@@ -32,15 +28,11 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum TimerEvent {
-    ElectionTimeout {
-        term: Term,
-        timestamp: time::Instant,
-    },
+    ElectionTimeout { term: Term, timestamp: Instant },
     // 当一个候选人从整个集群的大多数服务器节点获得了针对同一个任期号的选票，那么他就赢得了这次选举并成为领导人。
     // 候选人发起投票后，如果在一定时间内没有获得半数以上的投票的话，则视为失败
-    VoteTimeout {
-        term: Term,
-    },
+    VoteTimeout { term: Term },
+    HeartBeatTimeout { term: Term },
 }
 
 #[derive(Debug)]
@@ -90,7 +82,7 @@ pub enum Role {
     },
     Follower {
         voted_for: Option<ServerId>,
-        timestamp: time::Instant,
+        timestamp: Instant,
     },
 }
 
@@ -146,7 +138,7 @@ impl Server {
             last_applied: 0,
             role: Role::Follower {
                 voted_for: None,
-                timestamp: time::Instant::now(),
+                timestamp: Instant::now(),
             },
             peers,
             events_sender,
@@ -170,23 +162,45 @@ impl Server {
     pub fn start_election_timer(&mut self) {
         let event = Event::Timer(TimerEvent::ElectionTimeout {
             term: self.persistent_state.term,
-            timestamp: time::Instant::now(),
+            timestamp: Instant::now(),
         });
-        self.events_sender.send(event).unwrap();
+
+        let sender = self.events_sender.clone();
+        tokio::task::spawn(async move {
+            sleep(Duration::from_millis(1000)).await;
+            sender.send(event).unwrap();
+        });
     }
 
     pub fn start_vote_timer(&mut self) {
         let event = Event::Timer(TimerEvent::VoteTimeout {
             term: self.persistent_state.term,
         });
-        self.events_sender.send(event).unwrap();
+
+        let sender = self.events_sender.clone();
+        tokio::task::spawn(async move {
+            sleep(Duration::from_millis(1000)).await;
+            sender.send(event).unwrap();
+        });
     }
 
-    pub fn start_election(&mut self) {
+    pub fn start_heat_beat_timer(&mut self) {
+        let event = Event::Timer(TimerEvent::HeartBeatTimeout {
+            term: self.persistent_state.term,
+        });
+
+        let sender = self.events_sender.clone();
+        tokio::task::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            sender.send(event).unwrap();
+        });
+    }
+
+    pub fn start_request_vote(&mut self) {
         self.start_vote_timer();
 
-        match &self.role {
-            Role::Follower { .. } => {
+        match &mut self.role {
+            Role::Candidate { .. } => {
                 for (peer_id, peer) in self.peers.iter().map(|p| p.clone()).enumerate() {
                     let sender = self.events_sender.clone();
 
@@ -220,16 +234,11 @@ impl Server {
         }
     }
 
-    pub fn append_entries(&mut self) {
-        let success_cnt = Rc::new(RefCell::new(0));
+    pub fn start_append_entries(&mut self) {
         match &self.role {
             Role::Leader { next_index, .. } => {
                 for (peer_id, peer) in self.peers.iter().map(|p| p.clone()).enumerate() {
-                    if peer_id == self.persistent_state.id {
-                        continue;
-                    }
                     let sender = self.events_sender.clone();
-                    let success_cnt = success_cnt.clone();
 
                     let prev_entry_identifier = {
                         let index = next_index[peer_id] - 1;
@@ -246,21 +255,17 @@ impl Server {
                     };
 
                     tokio::task::spawn(async move {
-                        match peer
+                        if let Ok(response) = peer
                             .append_entries(context::current(), request.clone())
                             .await
                         {
-                            Ok(response) => {
-                                let event = Event::RPC(RPCEvent::AppendEntries(
-                                    AppendEntriesEvent::Response {
-                                        request,
-                                        response,
-                                        peer_id,
-                                    },
-                                ));
-                                sender.send(event).unwrap();
-                            }
-                            _ => {}
+                            let event =
+                                Event::RPC(RPCEvent::AppendEntries(AppendEntriesEvent::Response {
+                                    request,
+                                    response,
+                                    peer_id,
+                                }));
+                            sender.send(event).unwrap();
                         }
                     });
                 }
@@ -273,6 +278,7 @@ impl Server {
         let term = match &event {
             TimerEvent::ElectionTimeout { term, .. } => *term,
             TimerEvent::VoteTimeout { term, .. } => *term,
+            TimerEvent::HeartBeatTimeout { term, .. } => *term,
         };
         match term.cmp(&self.persistent_state.term) {
             Ordering::Less => {}
@@ -296,7 +302,7 @@ impl Server {
                         // 超时后通过增加当前任期号来开始一轮新的选举。
                         self.persistent_state.term += 1;
                         self.role = Role::Candidate { votes_cnt: 1 };
-                        self.start_election();
+                        self.start_request_vote();
                     } else {
                         self.start_election_timer();
                     }
@@ -306,14 +312,20 @@ impl Server {
                 (TimerEvent::VoteTimeout { .. }, Role::Leader { .. }) => {}
 
                 // 超时后通过增加当前任期号来开始一轮新的选举
-                (TimerEvent::VoteTimeout { .. }, Role::Candidate { votes_cnt, .. }) => {
+                (TimerEvent::VoteTimeout { .. }, Role::Candidate { .. }) => {
                     self.persistent_state.term += 1;
-                    *votes_cnt = 1;
-                    self.start_election();
+                    self.role = Role::Candidate { votes_cnt: 1 };
+                    self.start_request_vote();
                 }
 
                 // 在同一 term，可能先处于 Candidate 状态后处于 Follower 状态，忽略已过期的计时器
                 (TimerEvent::VoteTimeout { .. }, Role::Follower { .. }) => {}
+
+                (TimerEvent::HeartBeatTimeout { .. }, Role::Leader { .. }) => {}
+
+                (TimerEvent::HeartBeatTimeout { .. }, Role::Candidate { .. }) => {}
+
+                (TimerEvent::HeartBeatTimeout { .. }, Role::Follower { .. }) => {}
             },
         }
     }
@@ -357,7 +369,7 @@ impl Server {
                 self.persistent_state.term = remote_term;
                 self.role = Role::Follower {
                     voted_for: None,
-                    timestamp: time::Instant::now(),
+                    timestamp: Instant::now(),
                 };
                 self.react_rpc(event)
             }
@@ -411,7 +423,7 @@ impl Server {
             (event @ AppendEntriesEvent::Request { .. }, Role::Candidate { .. }) => {
                 self.role = Role::Follower {
                     voted_for: None,
-                    timestamp: time::Instant::now(),
+                    timestamp: Instant::now(),
                 };
                 return self.react_append_entries(event);
             }
@@ -421,7 +433,7 @@ impl Server {
             }
 
             (AppendEntriesEvent::Request { request, reply }, Role::Follower { timestamp, .. }) => {
-                *timestamp = time::Instant::now();
+                *timestamp = Instant::now();
 
                 // 返回假 如果接收者日志中没有包含这样一个条目 即该条目的任期在 prevLogIndex 上能和 prevLogTerm 匹配上
                 let (prev_term, prev_index) = request.prev_entry_identifier;
@@ -497,7 +509,10 @@ impl Server {
                         match_cnt: self.peers.iter().map(|_| 0).collect(),
                     };
                     // 然后他会向其他的服务器发送心跳消息来建立自己的权威并且阻止新的领导人的产生。
-                    self.append_entries();
+                    let event = Event::Timer(TimerEvent::HeartBeatTimeout {
+                        term: self.persistent_state.term,
+                    });
+                    self.events_sender.send(event).unwrap();
                 }
             }
 
@@ -523,7 +538,7 @@ impl Server {
                     if voted_for.is_none() {
                         *voted_for = Some(request.requester_id);
                     }
-                    *timestamp = time::Instant::now();
+                    *timestamp = Instant::now();
 
                     let resp = RequestVoteResp {
                         responser_term: self.persistent_state.term,
