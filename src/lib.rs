@@ -7,10 +7,14 @@ extern crate serde;
 
 use futures::prelude::*;
 use scopeguard::guard_on_success;
+use std::cell::RefCell;
 use std::cmp::{self, Ordering};
-use std::time;
+use std::rc::Rc;
+use std::sync::atomic::{self, AtomicUsize};
+use std::sync::Arc;
 use tarpc::context;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time;
 
 mod rpc;
 
@@ -90,10 +94,10 @@ pub enum Role {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Entry {
     term: Term,
-    command: usize,
+    command: String,
 }
 
 #[derive(Debug)]
@@ -105,24 +109,28 @@ pub struct PersistentState {
 
 impl PersistentState {
     pub fn new(id: ServerId) -> Self {
+        let initial_entry = Entry {
+            term: 0,
+            command: String::new(),
+        };
+
         PersistentState {
             term: 0,
             id,
-            log_entries: vec![],
+            log_entries: vec![initial_entry],
         }
     }
 
-    pub fn progress(&self) -> Option<(Term, usize)> {
-        let entry = self.log_entries.last();
-        entry.map(|Entry { term, .. }| (*term, self.log_entries.len() - 1))
+    pub async fn persist(&self) {
+        unimplemented!()
     }
 }
 
 #[derive(Debug)]
 pub struct Server {
     persistent_state: PersistentState,
-    commit_index: Option<usize>, // 已知已提交的最高的日志条目的索引（初始值为 0，单调递增）
-    last_applied: Option<usize>, // 已经被应用到状态机的最高的日志条目的索引（初始值为 0，单调递增）
+    commit_index: usize, // 已知已提交的最高的日志条目的索引（初始值为 0，单调递增）
+    last_applied: usize, // 已经被应用到状态机的最高的日志条目的索引（初始值为 0，单调递增）
     peers: Vec<RaftClient>,
     role: Role,
     events_sender: mpsc::UnboundedSender<Event>,
@@ -134,8 +142,8 @@ impl Server {
         let (events_sender, events_receiver) = mpsc::unbounded_channel();
         Server {
             persistent_state: PersistentState::new(id),
-            commit_index: None,
-            last_applied: None,
+            commit_index: 0,
+            last_applied: 0,
             role: Role::Follower {
                 voted_for: None,
                 timestamp: time::Instant::now(),
@@ -149,7 +157,7 @@ impl Server {
     pub fn run(mut self) {
         self.start_election_timer();
 
-        tokio::spawn(async move {
+        tokio::task::spawn(async move {
             while let Some(event) = self.events_receiver.recv().await {
                 match event {
                     Event::RPC(event) => self.react_rpc(event),
@@ -182,13 +190,17 @@ impl Server {
                 for (peer_id, peer) in self.peers.iter().map(|p| p.clone()).enumerate() {
                     let sender = self.events_sender.clone();
 
+                    let progress = {
+                        let term = self.persistent_state.log_entries.last().unwrap().term;
+                        (term, self.persistent_state.log_entries.len() - 1)
+                    };
                     let request = RequestVoteReq {
                         requester_term: self.persistent_state.term,
                         requester_id: self.persistent_state.id,
-                        prev_entry_identifier: self.persistent_state.progress(),
+                        progress,
                     };
 
-                    tokio::spawn(async move {
+                    tokio::task::spawn(async move {
                         match peer.request_vote(context::current(), request.clone()).await {
                             Ok(response) => {
                                 let event =
@@ -209,14 +221,20 @@ impl Server {
     }
 
     pub fn append_entries(&mut self) {
+        let success_cnt = Rc::new(RefCell::new(0));
         match &self.role {
             Role::Leader { next_index, .. } => {
                 for (peer_id, peer) in self.peers.iter().map(|p| p.clone()).enumerate() {
+                    if peer_id == self.persistent_state.id {
+                        continue;
+                    }
                     let sender = self.events_sender.clone();
+                    let success_cnt = success_cnt.clone();
 
-                    let prev_entry_identifier = next_index[peer_id]
-                        .checked_sub(1)
-                        .map(|idx| (self.persistent_state.log_entries[idx].term, idx));
+                    let prev_entry_identifier = {
+                        let index = next_index[peer_id] - 1;
+                        (self.persistent_state.log_entries[index].term, index)
+                    };
                     let entries =
                         Vec::from(&self.persistent_state.log_entries[next_index[peer_id]..]);
                     let request = AppendEntriesReq {
@@ -227,7 +245,7 @@ impl Server {
                         entries,
                     };
 
-                    tokio::spawn(async move {
+                    tokio::task::spawn(async move {
                         match peer
                             .append_entries(context::current(), request.clone())
                             .await
@@ -240,7 +258,7 @@ impl Server {
                                         peer_id,
                                     },
                                 ));
-                                sender.send(event).unwrap()
+                                sender.send(event).unwrap();
                             }
                             _ => {}
                         }
@@ -259,27 +277,19 @@ impl Server {
         match term.cmp(&self.persistent_state.term) {
             Ordering::Less => {}
             Ordering::Greater => unreachable!(),
-            Ordering::Equal => match (&mut self.role, event) {
+            Ordering::Equal => match (event, &mut self.role) {
                 // 在同一 term，不存在从 Follower 到 Leader 的转变，不应有 ElectionTimeout 事件
-                (Role::Leader { .. }, TimerEvent::ElectionTimeout { .. }) => unreachable!(),
-                // 在同一 term，可能先处于 Candidate 后处于 Leader，忽略已过期的定时器
-                (Role::Leader { .. }, TimerEvent::VoteTimeout { .. }) => {}
+                (TimerEvent::ElectionTimeout { .. }, Role::Leader { .. }) => unreachable!(),
 
                 // 在同一 term，不存在从 Follower 到 Candidate 的转变，不应有 ElectionTimeout 事件
-                (Role::Candidate { .. }, TimerEvent::ElectionTimeout { .. }) => unreachable!(),
-                // 超时后通过增加当前任期号来开始一轮新的选举
-                (Role::Candidate { votes_cnt, .. }, TimerEvent::VoteTimeout { .. }) => {
-                    self.persistent_state.term += 1;
-                    *votes_cnt = 1;
-                    self.start_election();
-                }
+                (TimerEvent::ElectionTimeout { .. }, Role::Candidate { .. }) => unreachable!(),
 
                 (
-                    Role::Follower { timestamp, .. },
                     TimerEvent::ElectionTimeout {
                         timestamp: e_timestamp,
                         ..
                     },
+                    Role::Follower { timestamp, .. },
                 ) => {
                     // 计时器未失效，即自从上次计时后没有新的 RPC 请求
                     if &e_timestamp == timestamp {
@@ -291,8 +301,19 @@ impl Server {
                         self.start_election_timer();
                     }
                 }
+
+                // 在同一 term，可能先处于 Candidate 后处于 Leader，忽略已过期的定时器
+                (TimerEvent::VoteTimeout { .. }, Role::Leader { .. }) => {}
+
+                // 超时后通过增加当前任期号来开始一轮新的选举
+                (TimerEvent::VoteTimeout { .. }, Role::Candidate { votes_cnt, .. }) => {
+                    self.persistent_state.term += 1;
+                    *votes_cnt = 1;
+                    self.start_election();
+                }
+
                 // 在同一 term，可能先处于 Candidate 状态后处于 Follower 状态，忽略已过期的计时器
-                (Role::Follower { .. }, TimerEvent::VoteTimeout { .. }) => {}
+                (TimerEvent::VoteTimeout { .. }, Role::Follower { .. }) => {}
             },
         }
     }
@@ -350,7 +371,7 @@ impl Server {
     pub fn react_append_entries(&mut self, event: AppendEntriesEvent) {
         match (event, &mut self.role) {
             // AppendEntries 请求只由 leader 发出，而同一任期内只应该有一个 leader
-            (AppendEntriesEvent::Request { .. }, Role::Leader { .. }) => {}
+            (AppendEntriesEvent::Request { .. }, Role::Leader { .. }) => unreachable!(),
             (
                 AppendEntriesEvent::Response {
                     request,
@@ -363,10 +384,24 @@ impl Server {
                 },
             ) => {
                 if response.success {
-                    next_index[peer_id] += request.entries.len();
-                    match_cnt[peer_id] += next_index[peer_id]; // ?
+                    next_index[peer_id] = cmp::max(
+                        next_index[peer_id],
+                        request.prev_entry_identifier.1 + request.entries.len(),
+                    );
+                    match_cnt[peer_id] = next_index[peer_id];
 
-                // 如果过半了
+                    for i in self.commit_index..next_index[peer_id] {
+                        let mut cnt = 0;
+                        for peer_id in 0..self.peers.len() {
+                            if match_cnt[peer_id] >= i {
+                                cnt += 1;
+                            }
+                        }
+
+                        if cnt > self.peers.len() / 2 {
+                            self.commit_index = i;
+                        }
+                    }
                 } else {
                     next_index[peer_id] -= 1;
                 }
@@ -389,49 +424,45 @@ impl Server {
                 *timestamp = time::Instant::now();
 
                 // 返回假 如果接收者日志中没有包含这样一个条目 即该条目的任期在 prevLogIndex 上能和 prevLogTerm 匹配上
-                if let Some((prev_index, prev_term)) = request.prev_entry_identifier {
-                    if self.persistent_state.log_entries[prev_index].term != prev_term {
-                        let resp = AppendEntriesResp {
-                            success: false,
-                            responser_term: self.persistent_state.term,
-                        };
-                        reply.send(resp).unwrap();
-                        return;
+                let (prev_term, prev_index) = request.prev_entry_identifier;
+                if self.persistent_state.log_entries[prev_index].term != prev_term {
+                    let resp = AppendEntriesResp {
+                        success: false,
+                        responser_term: self.persistent_state.term,
+                    };
+                    reply.send(resp).unwrap();
+                } else {
+                    let curr_index = prev_index + 1;
+
+                    self.persistent_state.log_entries.truncate(curr_index);
+                    for entry in request.entries {
+                        self.persistent_state.log_entries.push(entry);
                     }
-                }
+                    // 如果领导者的已知已经提交的最高的日志条目的索引 leaderCommit 大于 接收者的已知已经提交的最高的日志条目的索引 commitIndex
+                    if request.leader_commit > self.commit_index {
+                        self.commit_index = cmp::min(
+                            // 领导者的已知已经提交的最高的日志条目的索引
+                            request.leader_commit,
+                            // 上一个新条目的索引
+                            self.persistent_state.log_entries.len() - 1,
+                        );
+                    }
 
-                let curr_index = request
-                    .prev_entry_identifier
-                    .map(|(i, _)| i + 1)
-                    .unwrap_or(0);
-                self.persistent_state.log_entries.truncate(curr_index);
-                for entry in request.entries {
-                    self.persistent_state.log_entries.push(entry);
+                    let resp = AppendEntriesResp {
+                        success: true,
+                        responser_term: self.persistent_state.term,
+                    };
+                    reply.send(resp).unwrap();
                 }
-                // 如果领导者的已知已经提交的最高的日志条目的索引 leaderCommit 大于 接收者的已知已经提交的最高的日志条目的索引 commitIndex
-                if request.leader_commit > self.commit_index {
-                    self.commit_index = cmp::min(
-                        // 领导者的已知已经提交的最高的日志条目的索引
-                        request.leader_commit,
-                        // 上一个新条目的索引
-                        self.persistent_state.log_entries.len().checked_sub(1),
-                    );
-                }
-
-                let resp = AppendEntriesResp {
-                    success: true,
-                    responser_term: self.persistent_state.term,
-                };
-                reply.send(resp).unwrap();
             }
             // 在同一 term，可能先处于 Leader 后处于 Follower，忽略已过期的回复
             (AppendEntriesEvent::Response { .. }, Role::Follower { .. }) => {}
         }
 
-        if self.commit_index > self.last_applied {
-            self.last_applied = self.last_applied.map(|i| i + 1);
+        for i in self.last_applied + 1..=self.commit_index {
             // 并把 log_entries[last_applied] 应用到状态机中
         }
+        self.last_applied = self.commit_index;
     }
 
     pub fn react_request_vote(&mut self, event: RequestVoteEvent) {
@@ -458,10 +489,15 @@ impl Server {
                 // 当一个候选人从整个集群的大多数服务器节点获得了针对同一个任期号的选票，那么他就赢得了这次选举并成为领导人。
                 if *votes_cnt > self.peers.len() / 2 {
                     self.role = Role::Leader {
-                        next_index: self.peers.iter().map(|_| 0).collect(),
+                        next_index: self
+                            .peers
+                            .iter()
+                            .map(|_| self.persistent_state.log_entries.len())
+                            .collect(),
                         match_cnt: self.peers.iter().map(|_| 0).collect(),
                     };
                     // 然后他会向其他的服务器发送心跳消息来建立自己的权威并且阻止新的领导人的产生。
+                    self.append_entries();
                 }
             }
 
@@ -473,16 +509,28 @@ impl Server {
                     ..
                 },
             ) => {
-                if voted_for.is_none() {
-                    *voted_for = Some(request.requester_id);
-                }
-                *timestamp = time::Instant::now();
-
-                let resp = RequestVoteResp {
-                    responser_term: self.persistent_state.term,
-                    vote_granted: *voted_for == Some(request.requester_id),
+                let progress = {
+                    let term = self.persistent_state.log_entries.last().unwrap().term;
+                    (term, self.persistent_state.log_entries.len() - 1)
                 };
-                reply.send(resp).unwrap();
+                if request.progress < progress {
+                    let resp = RequestVoteResp {
+                        responser_term: self.persistent_state.term,
+                        vote_granted: false,
+                    };
+                    reply.send(resp).unwrap();
+                } else {
+                    if voted_for.is_none() {
+                        *voted_for = Some(request.requester_id);
+                    }
+                    *timestamp = time::Instant::now();
+
+                    let resp = RequestVoteResp {
+                        responser_term: self.persistent_state.term,
+                        vote_granted: *voted_for == Some(request.requester_id),
+                    };
+                    reply.send(resp).unwrap();
+                }
             }
             // 在同一 term，可能先处于 Candidate 后处于 Follower，忽略已过期的回复
             (RequestVoteEvent::Response { .. }, Role::Follower { .. }) => {}
@@ -490,32 +538,32 @@ impl Server {
     }
 }
 
-#[derive(Debug)]
-struct Service(usize);
+// #[derive(Debug)]
+// struct Service(usize);
 
-#[tarpc::server]
-impl Raft for Server {
-    async fn request_vote(
-        mut self,
-        _: context::Context,
-        request: RequestVoteReq,
-    ) -> RequestVoteResp {
-        let (tx, rx) = oneshot::channel();
-        let event = RPCEvent::RequestVote(RequestVoteEvent::Request { request, reply: tx });
+// #[tarpc::server]
+// impl Raft for Server {
+//     async fn request_vote(
+//         mut self,
+//         _: context::Context,
+//         request: RequestVoteReq,
+//     ) -> RequestVoteResp {
+//         let (tx, rx) = oneshot::channel();
+//         let event = RPCEvent::RequestVote(RequestVoteEvent::Request { request, reply: tx });
 
-        self.react_rpc(event);
-        rx.await.unwrap()
-    }
+//         self.react_rpc(event);
+//         rx.await.unwrap()
+//     }
 
-    async fn append_entries(
-        mut self,
-        _: context::Context,
-        request: AppendEntriesReq,
-    ) -> AppendEntriesResp {
-        let (tx, rx) = oneshot::channel();
-        let event = RPCEvent::AppendEntries(AppendEntriesEvent::Request { request, reply: tx });
+//     async fn append_entries(
+//         mut self,
+//         _: context::Context,
+//         request: AppendEntriesReq,
+//     ) -> AppendEntriesResp {
+//         let (tx, rx) = oneshot::channel();
+//         let event = RPCEvent::AppendEntries(AppendEntriesEvent::Request { request, reply: tx });
 
-        self.react_rpc(event);
-        rx.await.unwrap()
-    }
-}
+//         self.react_rpc(event);
+//         rx.await.unwrap()
+//     }
+// }

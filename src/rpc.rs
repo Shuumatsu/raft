@@ -4,7 +4,7 @@ use crate::{Entry, ServerId, Term};
 pub struct RequestVoteReq {
     pub requester_term: Term,
     pub requester_id: ServerId,
-    pub prev_entry_identifier: Option<(Term, usize)>, // (term, index) of last log entry
+    pub progress: (Term, usize), // (term, index) of last log entry
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -17,8 +17,8 @@ pub struct RequestVoteResp {
 pub struct AppendEntriesReq {
     pub requester_term: Term,
     pub requester_id: ServerId,
-    pub prev_entry_identifier: Option<(Term, usize)>, // (term, index) of log entry immediately preceding new ones
-    pub leader_commit: Option<usize>,                 // leader's commit_ndex
+    pub prev_entry_identifier: (Term, usize), // (term, index) of log entry immediately preceding new ones
+    pub leader_commit: usize,                 // leader's commit_ndex
     pub entries: Vec<Entry>,
 }
 
