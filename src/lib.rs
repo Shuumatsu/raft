@@ -33,13 +33,16 @@ pub enum Role {
         next_index: HashMap<ServerId, usize>,
         // for each server, number of log entries known to be replicated on server
         match_index: HashMap<ServerId, usize>,
+        sequence_number: HashMap<ServerId, usize>,
+        replied_sequence_number: HashMap<ServerId, usize>,
     },
     Candidate {
         votes_count: usize,
     },
     Follower {
         voted_for: Option<ServerId>,
-        rpc_ts: Instant,
+        last_sequence_number: usize,
+        last_rpc_timestamp: Instant,
     },
 }
 
@@ -78,15 +81,21 @@ pub struct Server {
     last_applied: usize, // 已经被应用到状态机的最高的日志条目的索引（初始值为 0，单调递增）
     events_sender: event_channel::Sender,
     events_receiver: event_channel::Receiver,
+    apply_ch: mpsc::UnboundedSender<Entry>,
 }
 
 impl Server {
-    pub fn new(id: usize, peers: HashMap<ServerId, RaftClient>) -> Self {
+    pub fn new(
+        id: usize,
+        peers: HashMap<ServerId, RaftClient>,
+        apply_ch: mpsc::UnboundedSender<Entry>,
+    ) -> Self {
         let (events_sender, events_receiver) = event_channel::new();
         Server {
             role: Role::Follower {
                 voted_for: None,
-                rpc_ts: Instant::now(),
+                last_sequence_number: 0,
+                last_rpc_timestamp: Instant::now(),
             },
             peers,
             persistent_state: PersistentState::new(id),
@@ -94,7 +103,67 @@ impl Server {
             last_applied: 0,
             events_sender,
             events_receiver,
+            apply_ch,
         }
+    }
+
+    pub fn become_leader(&mut self) {
+        match self.role {
+            Role::Leader { .. } => unreachable!(),
+            Role::Candidate { .. } => {
+                self.role = Role::Leader {
+                    next_index: self
+                        .peers
+                        .iter()
+                        .map(|(&peer_id, _)| (peer_id, self.persistent_state.log_entries.len()))
+                        .collect(),
+                    match_index: self
+                        .peers
+                        .iter()
+                        .map(|(&peer_id, _)| (peer_id, 0))
+                        .collect(),
+                    sequence_number: self
+                        .peers
+                        .iter()
+                        .map(|(&peer_id, _)| (peer_id, 0))
+                        .collect(),
+                    replied_sequence_number: self
+                        .peers
+                        .iter()
+                        .map(|(&peer_id, _)| (peer_id, 0))
+                        .collect(),
+                };
+
+                // 然后他会向其他的服务器发送心跳消息来建立自己的权威并且阻止新的领导人的产生。
+                let event = TimerEvent::HeartBeatTimeout {
+                    term: self.persistent_state.term,
+                };
+                self.events_sender.send_timer_event(event).unwrap();
+            }
+            Role::Follower { .. } => unreachable!(),
+        }
+    }
+
+    pub fn become_candidate(&mut self) {
+        match self.role {
+            Role::Leader { .. } => unreachable!(),
+            Role::Candidate { .. } => unreachable!(),
+            Role::Follower { .. } => {
+                self.persistent_state.term += 1;
+                self.role = Role::Candidate { votes_count: 1 };
+                self.start_request_vote();
+            }
+        }
+    }
+
+    pub fn become_follower(&mut self, next_term: Term) {
+        self.persistent_state.term = next_term;
+        self.role = Role::Follower {
+            voted_for: None,
+            last_sequence_number: 0,
+            last_rpc_timestamp: Instant::now(),
+        };
+        self.start_election_timer();
     }
 
     pub fn run(mut self) {
@@ -202,10 +271,23 @@ impl Server {
 
     pub fn start_append_entries(&mut self) {
         match &mut self.role {
-            Role::Leader { next_index, .. } => {
+            Role::Leader {
+                replied_sequence_number,
+                sequence_number,
+                next_index,
+                ..
+            } => {
                 for (&peer_id, peer) in self.peers.iter() {
                     let sender = self.events_sender.clone();
                     let peer = peer.clone();
+
+                    match replied_sequence_number[&peer_id].cmp(&sequence_number[&peer_id]) {
+                        Ordering::Less => {}
+                        Ordering::Equal => {
+                            sequence_number.entry(peer_id).and_modify(|s| *s += 1);
+                        }
+                        Ordering::Greater => unreachable!(),
+                    }
 
                     let (prev_entry_index, prev_entry_term) = {
                         let index = next_index[&peer_id] - 1;
@@ -214,8 +296,9 @@ impl Server {
                     let entries =
                         Vec::from(&self.persistent_state.log_entries[next_index[&peer_id]..]);
                     let request = AppendEntriesReq {
-                        requester_term: self.persistent_state.term,
                         requester_id: self.persistent_state.id,
+                        requester_term: self.persistent_state.term,
+                        sequence_number: sequence_number[&peer_id],
                         prev_entry_index,
                         prev_entry_term,
                         leader_commit: self.commit_index,
@@ -258,20 +341,15 @@ impl Server {
                 (TimerEvent::ElectionTimeout { .. }, Role::Candidate { .. }) => unreachable!(),
 
                 (
-                    TimerEvent::ElectionTimeout {
-                        timestamp: e_timestamp,
-                        ..
-                    },
+                    TimerEvent::ElectionTimeout { timestamp, .. },
                     Role::Follower {
-                        rpc_ts: timestamp, ..
+                        last_rpc_timestamp, ..
                     },
                 ) => {
                     // 计时器未失效，即自从上次计时后没有新的 RPC 请求
-                    if &e_timestamp == timestamp {
+                    if &timestamp == last_rpc_timestamp {
                         // 超时后通过增加当前任期号来开始一轮新的选举。
-                        self.persistent_state.term += 1;
-                        self.role = Role::Candidate { votes_count: 1 };
-                        self.start_request_vote();
+                        self.become_candidate();
                     } else {
                         self.start_election_timer();
                     }
@@ -281,11 +359,7 @@ impl Server {
                 (TimerEvent::VoteTimeout { .. }, Role::Leader { .. }) => {}
 
                 // 超时后通过增加当前任期号来开始一轮新的选举
-                (TimerEvent::VoteTimeout { .. }, Role::Candidate { .. }) => {
-                    self.persistent_state.term += 1;
-                    self.role = Role::Candidate { votes_count: 1 };
-                    self.start_request_vote();
-                }
+                (TimerEvent::VoteTimeout { .. }, Role::Candidate { .. }) => self.become_candidate(),
 
                 // 在同一 term，可能先处于 Candidate 状态后处于 Follower 状态，忽略已过期的计时器
                 (TimerEvent::VoteTimeout { .. }, Role::Follower { .. }) => {}
@@ -323,13 +397,7 @@ impl Server {
 
         match (remote_term.cmp(&self.persistent_state.term), event) {
             (Ordering::Greater, event) => {
-                self.persistent_state.term = remote_term;
-                self.role = Role::Follower {
-                    voted_for: None,
-                    rpc_ts: Instant::now(),
-                };
-                self.start_election_timer();
-
+                self.become_follower(remote_term);
                 self.react_rpc(event)
             }
             (_, RPCEvent::RequestVote(event)) => self.react_request_vote(event),
@@ -378,23 +446,7 @@ impl Server {
                 *votes_cnt += if response.vote_granted { 1 } else { 0 };
                 // 当一个候选人从整个集群的大多数服务器节点获得了针对同一个任期号的选票，那么他就赢得了这次选举并成为领导人。
                 if *votes_cnt == self.peers.len() / 2 + 1 {
-                    self.role = Role::Leader {
-                        next_index: self
-                            .peers
-                            .iter()
-                            .map(|(&peer_id, _)| (peer_id, self.persistent_state.log_entries.len()))
-                            .collect(),
-                        match_index: self
-                            .peers
-                            .iter()
-                            .map(|(&peer_id, _)| (peer_id, 0))
-                            .collect(),
-                    };
-                    // 然后他会向其他的服务器发送心跳消息来建立自己的权威并且阻止新的领导人的产生。
-                    let event = TimerEvent::HeartBeatTimeout {
-                        term: self.persistent_state.term,
-                    };
-                    self.events_sender.send_timer_event(event).unwrap();
+                    self.become_leader();
                 }
             }
 
@@ -402,7 +454,7 @@ impl Server {
                 RequestVoteEvent::Request { request, reply, .. },
                 Role::Follower {
                     voted_for,
-                    rpc_ts: timestamp,
+                    last_rpc_timestamp,
                     ..
                 },
             ) => {
@@ -417,14 +469,18 @@ impl Server {
                     };
                     reply.send(resp).unwrap();
                 } else {
-                    if voted_for.is_none() {
+                    *last_rpc_timestamp = Instant::now();
+                    let resp = if let Some(_) = voted_for {
+                        RequestVoteResp {
+                            responser_term: self.persistent_state.term,
+                            vote_granted: false,
+                        }
+                    } else {
                         *voted_for = Some(request.requester_id);
-                    }
-                    *timestamp = Instant::now();
-
-                    let resp = RequestVoteResp {
-                        responser_term: self.persistent_state.term,
-                        vote_granted: *voted_for == Some(request.requester_id),
+                        RequestVoteResp {
+                            responser_term: self.persistent_state.term,
+                            vote_granted: true,
+                        }
                     };
                     reply.send(resp).unwrap();
                 }
@@ -461,46 +517,56 @@ impl Server {
                 Role::Leader {
                     next_index,
                     match_index,
+                    sequence_number,
+                    replied_sequence_number,
                 },
-            ) => match response.result {
-                Ok(()) => {
-                    next_index.insert(peer_id, request.prev_entry_index + request.entries.len());
-                    match_index.insert(peer_id, next_index[&peer_id] - 1);
+            ) => {
+                if request.sequence_number > replied_sequence_number[&peer_id] {
+                    replied_sequence_number.insert(peer_id, request.sequence_number);
 
-                    let mut appended_index = self.commit_index;
-                    for entry_index in self.commit_index + 1..=match_index[&peer_id] {
-                        let cnt = self.peers.keys().fold(1, |accu, peer_id| {
-                            accu + if match_index[peer_id] >= entry_index {
-                                1
-                            } else {
-                                0
+                    match response.result {
+                        Ok(()) => {
+                            next_index
+                                .insert(peer_id, request.prev_entry_index + request.entries.len());
+                            match_index.insert(peer_id, next_index[&peer_id] - 1);
+
+                            let mut appended_index = self.commit_index;
+                            for entry_index in self.commit_index + 1..=match_index[&peer_id] {
+                                let cnt = self.peers.keys().fold(1, |accu, peer_id| {
+                                    accu + if match_index[peer_id] >= entry_index {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                });
+                                if cnt > (self.peers.len() + 1) / 2 {
+                                    appended_index = entry_index;
+                                } else {
+                                    break;
+                                }
                             }
-                        });
-                        if cnt > (self.peers.len() + 1) / 2 {
-                            appended_index = entry_index;
-                        } else {
-                            break;
+                            if self.persistent_state.log_entries[appended_index].term
+                                == self.persistent_state.term
+                            {
+                                self.commit_index = appended_index;
+                            }
+                        }
+                        Err(AppendEntriesError::Outdated) => {}
+                        Err(AppendEntriesError::Conflict {
+                            recommended_next_index,
+                        }) => {
+                            next_index.insert(peer_id, recommended_next_index);
                         }
                     }
-                    if self.persistent_state.log_entries[appended_index].term
-                        == self.persistent_state.term
-                    {
-                        self.commit_index = appended_index;
-                    }
                 }
-                Err(AppendEntriesError::Outdated) => {}
-                Err(AppendEntriesError::Conflict {
-                    recommended_next_index,
-                }) => {
-                    next_index.insert(peer_id, recommended_next_index);
-                }
-            },
+            }
 
             // 同期内有其他服务器成为 Leader
             (event @ AppendEntriesEvent::Request { .. }, Role::Candidate { .. }) => {
                 self.role = Role::Follower {
                     voted_for: None,
-                    rpc_ts: Instant::now(),
+                    last_rpc_timestamp: Instant::now(),
+                    last_sequence_number: 0,
                 };
                 self.start_election_timer();
 
@@ -514,10 +580,16 @@ impl Server {
             (
                 AppendEntriesEvent::Request { request, reply },
                 Role::Follower {
-                    rpc_ts: timestamp, ..
+                    last_rpc_timestamp,
+                    last_sequence_number,
+                    ..
                 },
             ) => {
-                *timestamp = Instant::now();
+                if request.sequence_number <= *last_sequence_number {
+                    return;
+                }
+                *last_sequence_number = request.sequence_number;
+                *last_rpc_timestamp = Instant::now();
 
                 // 返回假 如果接收者日志中没有包含这样一个条目 即该条目的任期在 prevLogIndex 上能和 prevLogTerm 匹配上
                 if request.prev_entry_index >= self.persistent_state.log_entries.len() {
@@ -569,6 +641,9 @@ impl Server {
 
         for i in self.last_applied + 1..=self.commit_index {
             // 并把 log_entries[last_applied] 应用到状态机中
+            self.apply_ch
+                .send(self.persistent_state.log_entries[i].clone())
+                .unwrap();
         }
         self.last_applied = self.commit_index;
     }

@@ -23,8 +23,9 @@ pub struct RequestVoteResp {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppendEntriesReq {
-    pub requester_term: Term,
     pub requester_id: ServerId,
+    pub requester_term: Term,
+    pub sequence_number: usize,
     pub prev_entry_index: usize,
     pub prev_entry_term: Term,
     pub leader_commit: usize,
