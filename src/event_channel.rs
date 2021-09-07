@@ -86,7 +86,7 @@ impl Sender {
     }
 
     pub fn send_timer_event(&self, event: TimerEvent) -> Result<(), SendError<Event>> {
-        self.inner.send(Event::Timer(event))
+        self.send_event(Event::Timer(event))
     }
 
     pub fn send_rpc_event(&self, event: RPCEvent) -> Result<(), SendError<Event>> {
@@ -97,11 +97,11 @@ impl Sender {
         &self,
         event: AppendEntriesEvent,
     ) -> Result<(), SendError<Event>> {
-        self.inner.send(Event::RPC(RPCEvent::AppendEntries(event)))
+        self.send_rpc_event(RPCEvent::AppendEntries(event))
     }
 
     pub fn send_request_vote_event(&self, event: RequestVoteEvent) -> Result<(), SendError<Event>> {
-        self.inner.send(Event::RPC(RPCEvent::RequestVote(event)))
+        self.send_rpc_event(RPCEvent::RequestVote(event))
     }
 }
 
